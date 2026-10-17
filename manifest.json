@@ -1,15 +1,15 @@
 {
   "name": "Russian Cinema for Nuvio",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "scrapers": [{
     "id": "russian-cinema",
     "name": "Russian Cinema",
-    "description": "Russian-language movie and series sources from Filmix and Seasonvar.",
-    "version": "1.0.0",
+    "description": "Filmix, Seasonvar and 1080p Collaps sources, with optional KinoPub and HDVB account access.",
+    "version": "1.1.0",
     "filename": "russian-cinema.js",
     "supportedTypes": ["movie", "tv", "series"],
     "contentLanguage": ["ru"],
-    "formats": ["m3u8", "mp4"],
+    "formats": ["m3u8", "mp4", "mpd"],
     "enabled": true,
     "hasSettings": true,
     "supportsExternalPlayer": true
