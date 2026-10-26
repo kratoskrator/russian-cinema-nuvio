@@ -1,4 +1,4 @@
-/* Russian Cinema for Nuvio v1.1.0
+/* Russian Cinema for Nuvio v1.1.1
 MIT License
 
 Copyright (c) 2026 Russian Cinema Nuvio provider contributors
@@ -135,7 +135,12 @@ function safeError(message, blocked, transient) {
 
 // Only request state is retained. Native TV redirects do not safely scope a
 // manually supplied Cookie header, so this provider never copies site cookies.
-function session(deadline) { return { deadline: deadline || Date.now() + 50000, blocked: {} }; }
+function session(deadline) { return { deadline: deadline || Date.now() + 50000, blocked: {}, pending: [], cancelled: false }; }
+function cancel(state) {
+  if (!state || state.cancelled) return;
+  state.cancelled = true;
+  (state.pending || []).slice().forEach(function (stop) { stop(); });
+}
 
 // The TV bridge preserves raw bytes but only decodes UTF-8/Latin-1 itself.
 var CP1251 = 'ЂЃ‚ѓ„…†‡€‰Љ‹ЊЌЋЏђ‘’“”•–—\u0098™љ›њќћџ\u00a0ЎўЈ¤Ґ¦§Ё©Є«¬\u00ad®Ї°±Ііґµ¶·ё№є»јЅѕї';
@@ -212,6 +217,7 @@ function request(url, options) {
   }
 
   function attempt(number) {
+    if (state.cancelled) return Promise.reject(safeError('Lookup completed'));
     if (state.blocked[site]) return Promise.reject(safeError(state.blocked[site], true));
     var remaining = state.deadline - Date.now();
     if (remaining <= 0) return Promise.reject(safeError('Lookup time budget exhausted: ' + site));
@@ -223,8 +229,16 @@ function request(url, options) {
         if (finished) return;
         finished = true;
         if (timer !== null && typeof clearTimeout === 'function') clearTimeout(timer);
+        var pending = state.pending || [], index = pending.indexOf(stop);
+        if (index >= 0) pending.splice(index, 1);
         if (error) reject(error); else resolve(value);
       }
+      function stop() {
+        finish(safeError('Lookup completed'));
+        if (controller) controller.abort();
+      }
+      if (!state.pending) state.pending = [];
+      state.pending.push(stop);
       if (typeof setTimeout === 'function') {
         timer = setTimeout(function () {
           finish(safeError('Request timed out: ' + site, false, true));
@@ -234,7 +248,7 @@ function request(url, options) {
       var init = { method: method, headers: headers, credentials: 'same-origin' };
       if (options.body !== undefined) init.body = options.body;
       if (controller) init.signal = controller.signal;
-      Promise.resolve().then(function () { return fetch(url, init); }).then(function (response) {
+      Promise.resolve().then(function () { if (finished) return null; return fetch(url, init); }).then(function (response) {
         if (finished) return;
         var mitigation = response.headers && typeof response.headers.get === 'function' ? response.headers.get('cf-mitigated') : '';
         if (response.status === 403 || response.status === 429 || response.status === 451) throw blocked('Site access blocked (HTTP ' + response.status + '): ' + site);
@@ -244,6 +258,7 @@ function request(url, options) {
           if (finished) return;
           var body = result.body;
           if (result.bytes >= MAX_BYTES) throw safeError('Response reaches TV size limit: ' + site);
+          if (body.length < 512 && /^(?:Технические работы|Technical maintenance|Temporarily unavailable)[.!\s]*$/i.test(u.text(body))) throw blocked('Website maintenance: ' + site);
           if (/<title[^>]*>\s*(?:Just a moment|Attention Required|Проверяем, что вы не бот)/i.test(body) || /cf-browser-verification|class=["']cf-turnstile|id=["']anubis_challenge/i.test(body)) throw blocked('Website verification required: ' + site);
           if (!response.ok) throw safeError('HTTP ' + response.status + ': ' + site, false, [502, 503, 504].indexOf(response.status) !== -1);
           var value = body;
@@ -265,14 +280,14 @@ function request(url, options) {
     }).catch(function (error) {
       // One GET retry for a transport failure or a temporary upstream outage.
       // Never retry access restrictions, verification pages, or malformed data.
-      if (method === 'GET' && number === 0 && error.transient && state.deadline - Date.now() >= timeout) return attempt(1);
+      if (!state.cancelled && method === 'GET' && number === 0 && error.transient && state.deadline - Date.now() >= timeout) return attempt(1);
       throw error;
     });
   }
   return attempt(0);
 }
 
-module.exports = { request: request, USER_AGENT: USER_AGENT, session: session };
+module.exports = { request: request, USER_AGENT: USER_AGENT, session: session, cancel: cancel };
 
 },
 "media": function(module, exports, require) {
@@ -1464,7 +1479,7 @@ function metadata(id, type, cfg) {
 }
 
 function client(cfg) {
-  var state = http.session(cfg.deadline);
+  var state = cfg.state;
   return { request: function (url, options) {
     options = options || {};
     options.session = state;
@@ -1478,6 +1493,7 @@ function source(label, module, meta, season, episode, cfg) {
   }).then(function (streams) {
     return (Array.isArray(streams) ? streams : []).slice(0, 8).map(function (stream) { stream.sourceName = label; return stream; });
   }).catch(function (error) {
+    if (cfg.state.cancelled) return [];
     console.warn('[Russian Cinema / ' + label + '] ' + (error && error.providerSafe ? error.message : 'Source resolution failed.'));
     return [];
   });
@@ -1505,7 +1521,7 @@ function verify(stream, cfg) {
   // Nuvio TV's native bridge maps HEAD to GET. A small byte range avoids
   // requesting the video body while checking that an MP4 URL is still usable.
   if (!hls && !dash) headers.Range = 'bytes=0-63';
-  var opts = { session: http.session(cfg.deadline), headers: headers, responseInfo: true, method: 'GET', binary: !hls && !dash };
+  var opts = { session: cfg.state, headers: headers, responseInfo: true, method: 'GET', binary: !hls && !dash };
   return http.request(stream.url, opts).then(function (response) {
     if (hls || dash) {
       var details = dash ? media.dash(response.body) : media.hls(response.body);
@@ -1529,22 +1545,66 @@ function getStreams(tmdbId, mediaType, season, episode) {
   if (type === 'tv' && (!/^\d+$/.test(String(season)) || !/^\d+$/.test(String(episode)) || Number(season) < 0 || Number(episode) < 1)) return Promise.resolve([]);
   if (type === 'tv') { season = Number(season); episode = Number(episode); }
   var cfg = settings();
+  cfg.state = http.session(cfg.deadline);
   return metadata(String(tmdbId), type, cfg).then(function (meta) {
-    return Promise.all([
-      source('Filmix', filmix, meta, season, episode, cfg),
-      type === 'tv' ? source('Seasonvar', seasonvar, meta, season, episode, cfg) : Promise.resolve([]),
-      source('Collaps', collaps, meta, season, episode, cfg),
-      cfg.kinopubToken ? source('KinoPub', kinopub, meta, season, episode, cfg) : Promise.resolve([]),
-      cfg.hdvbToken ? source('HDVB', hdvb, meta, season, episode, cfg) : Promise.resolve([])
-    ]).then(function (results) {
-      var seen = {};
-      var all = [];
-      results.forEach(function (list) { all = all.concat(list); });
-      var candidates = all.filter(function (stream) {
-        if (!stream || !stream.url || seen[stream.url]) return false;
-        seen[stream.url] = true; return true;
+    var providers = [
+      { label: 'Filmix', module: filmix },
+      { label: 'Seasonvar', module: seasonvar, skip: type !== 'tv' },
+      { label: 'Collaps', module: collaps },
+      { label: 'KinoPub', module: kinopub, skip: !cfg.kinopubToken },
+      { label: 'HDVB', module: hdvb, skip: !cfg.hdvbToken }
+    ];
+    return new Promise(function (resolve) {
+      var seen = {}, found = providers.map(function () { return []; }), completed = {}, remaining = providers.length, done = false;
+      function finish() {
+        if (done) return;
+        done = true;
+        var streams = [];
+        found.forEach(function (list) { list.forEach(function (stream) { if (stream) streams.push(stream); }); });
+        http.cancel(cfg.state);
+        resolve(streams);
+      }
+      function check() {
+        if (done) return;
+        if (!remaining) { finish(); return; }
+        // Once both an HD choice and a broadly compatible HLS/MP4 choice are
+        // verified, unrelated slow origins cannot hold up the source list.
+        // Configured account providers finish first so their higher-quality
+        // entitlement is not silently dropped for an anonymous source.
+        if (cfg.kinopubToken && !completed.KinoPub || cfg.hdvbToken && !completed.HDVB) return;
+        var hd = false, compatible = false;
+        found.forEach(function (list) { list.forEach(function (stream) {
+          if (!stream) return;
+          if (parseInt(stream.quality, 10) >= 1080) hd = true;
+          if (stream.type === 'hls' || stream.type === 'mp4') compatible = true;
+        }); });
+        if (hd && compatible) finish();
+      }
+      providers.forEach(function (provider, index) {
+        var lookup = provider.skip ? Promise.resolve([]) : source(provider.label, provider.module, meta, season, episode, cfg);
+        lookup.then(function (streams) {
+          if (done) return [];
+          return Promise.all(streams.map(function (stream, streamIndex) {
+            if (!stream || !stream.url || seen[stream.url]) return null;
+            seen[stream.url] = true;
+            return verify(stream, cfg).then(function (verified) {
+              if (done) return;
+              found[index][streamIndex] = verified;
+              check();
+            });
+          }));
+        }).then(function () {
+          if (done) return;
+          completed[provider.label] = true;
+          remaining--;
+          check();
+        }).catch(function () {
+          if (done) return;
+          completed[provider.label] = true;
+          remaining--;
+          check();
+        });
       });
-      return Promise.all(candidates.map(function (stream) { return verify(stream, cfg); }));
     }).then(function (streams) {
       return streams.filter(Boolean).map(function (stream) {
         var headers = playbackHeaders(stream.headers);
